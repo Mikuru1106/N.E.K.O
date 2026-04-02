@@ -5379,20 +5379,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (modelSuccess) {
                 showStatus(t('live2d.settingsSaved', '模型设置保存成功!'), 2000);
                 window.hasUnsavedChanges = false;
+                window._savedModelSnapshot = {
+                    modelType: currentModelType,
+                    live2d: modelSelect ? modelSelect.value : '',
+                    live3d: vrmModelSelect ? vrmModelSelect.value : '',
+                };
                 window._modelManagerHasSaved = true;
-                // 不在保存时立即通知主页，而是在返回主页时通知
-                // if (window.opener && !window.opener.closed) {
-                //     try {
-                //         window.opener.postMessage({
-                //             action: 'model_saved',
-                //             timestamp: Date.now()
-                //         }, window.location.origin);
-                //         console.log('[消息发送] VRM模型保存成功，立即发送 model_saved 消息');
-                //     } catch (e) {
-                //         console.warn('发送保存成功消息失败:', e);
-                //     }
-                // }
-                // sendMessageToMainPage('reload_model');
             } else {
                 showStatus(t('live2d.saveFailedGeneral', '保存失败!'), 2000);
             }
@@ -5401,6 +5393,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (positionSuccess && modelSuccess) {
                 showStatus(t('live2d.settingsSaved', '位置和模型设置保存成功!'), 2000);
                 window.hasUnsavedChanges = false; // 保存成功后重置标志
+                window._savedModelSnapshot = {
+                    modelType: currentModelType,
+                    live2d: modelSelect ? modelSelect.value : '',
+                    live3d: vrmModelSelect ? vrmModelSelect.value : '',
+                };
                 window._modelManagerHasSaved = true;
                 // 不在保存时立即通知主页，而是在返回主页时通知
                 // sendMessageToMainPage('reload_model');
@@ -5470,7 +5467,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         _earlyBackBtn.removeEventListener('click', _earlyBackHandler);
     }
     backToMainBtn.addEventListener('click', async () => {
-        // 检查是否有未保存的更改
+        // 检查是否有未保存的更改：先比对当前模型选择和已保存快照，一致则视为无更改
+        if (window.hasUnsavedChanges && window._savedModelSnapshot) {
+            const snap = window._savedModelSnapshot;
+            // 只比较当前激活分支的模型选择，隐藏分支的变化不触发未保存提示
+            const branchMatch = currentModelType === 'live2d'
+                ? (modelSelect ? modelSelect.value : '') === snap.live2d
+                : (vrmModelSelect ? vrmModelSelect.value : '') === snap.live3d;
+            if (currentModelType === snap.modelType && branchMatch) {
+                window.hasUnsavedChanges = false;
+            }
+        }
         if (window.hasUnsavedChanges) {
             const message = t('dialogs.unsavedChanges', '您有未保存的设置，确定要离开吗？');
             const title = t('dialogs.confirmLeave', '确认离开');
@@ -5480,7 +5487,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             // 用户确认离开，重置未保存状态，避免被 beforeunload 拦截
             window.hasUnsavedChanges = false;
-        } else {
         }
 
         // 如果处于全屏状态，先退出全屏
@@ -7137,6 +7143,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             modelSelect.value = currentModelInfo.name;
         }
     }
+
+    // 记录初始化完成时各 select 的已保存值，用于退出前判断模型是否真的被改过
+    window._savedModelSnapshot = {
+        modelType: currentModelType,
+        live2d: modelSelect ? modelSelect.value : '',
+        live3d: vrmModelSelect ? vrmModelSelect.value : '',
+    };
   } catch (_fatalError) {
     console.error('[模型管理] DOMContentLoaded 致命错误:', _fatalError);
     const _s = document.getElementById('status-text');
