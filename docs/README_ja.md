@@ -490,7 +490,7 @@ N.E.K.O/
 └── memory_server.py             # 🧠 記憶サーバー
 ```
 
-> **AI支援開発**：`.agent/` ディレクトリには、AIコーディングアシスタント（Claude Code、Cursor など）向けの開発ルールとスキルセットが含まれています。これらのツールをサポートするAIエージェントは、自動的にルールを読み込んで従います。詳細は[開発者ドキュメント](https://project-neko.online/contributing/ai-assisted-dev)をご覧ください。
+> **AI支援開発**：`.agent/` ディレクトリは Google Antigravity オープン規約に従い、プロジェクトの開発ルールとスキルセットを格納しています。Claude Code ではそのまま利用可能。他のAIツールについては[適応ガイド](https://project-neko.online/contributing/ai-assisted-dev)を参照してください。
 
 **データフロー**
 

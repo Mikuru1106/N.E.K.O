@@ -498,7 +498,7 @@ N.E.K.O/
 └── memory_server.py             # 🧠 Memory server
 ```
 
-> **AI-Assisted Development**: The `.agent/` directory contains development rules and skill sets for AI coding assistants (Claude Code, Cursor, etc.). AI agents that support these tools will automatically load and follow the rules within. See the [developer docs](https://project-neko.online/contributing/ai-assisted-dev) for details.
+> **AI-Assisted Development**: The `.agent/` directory follows the Google Antigravity open convention and contains the project's development rules and skill sets. Works out of the box with Claude Code; for other AI tools see the [adaptation guide](https://project-neko.online/contributing/ai-assisted-dev).
 
 **Data Flow**
 
