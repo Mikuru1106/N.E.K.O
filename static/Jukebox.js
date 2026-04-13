@@ -4562,13 +4562,15 @@ window.Jukebox = {
       // 根据模型类型播放对应格式的动画
       const action = Jukebox.getActionForModel(song);
       if (action) {
-        // 处理动画路径：自带资源使用 /static/jukebox/ 前缀
+        // 处理动画路径：自带资源直接用 /static/ 路径，用户上传的走 API
         let actionFilePath = action.file || '';
+        let actionUrl;
         if (action.isBuiltin && actionFilePath && !actionFilePath.startsWith('/static/')) {
           // 将 actions/xxx.vmd 转换为 /static/jukebox/xxx.vmd
-          actionFilePath = '/static/jukebox/' + actionFilePath.replace(/^actions\//, '');
+          actionUrl = '/static/jukebox/' + actionFilePath.replace(/^actions\//, '');
+        } else {
+          actionUrl = `/api/jukebox/file/${actionFilePath}`;
         }
-        const actionUrl = `/api/jukebox/file/${actionFilePath}`;
         console.log('[Jukebox] 播放动画:', action.name, '格式:', action.format || 'vmd', '路径:', actionUrl);
 
         const modelType = Jukebox.getModelType();
@@ -4703,18 +4705,14 @@ window.Jukebox = {
 
       Jukebox.stopVMD(true); // 停止之前的舞蹈动画
 
-      // 使用 VRMManager 的动画模块播放 VRMA
-      if (window.vrmManager.animationModule) {
-        await window.vrmManager.animationModule.playVRMAAnimation(vrmaPath, {
-          loop: false,
-          fadeInDuration: 0.5,
-          fadeOutDuration: 0.5
-        });
-        Jukebox.State.isVMDPlaying = true;
-        console.log('[Jukebox] VRMA 动画已播放:', vrmaPath);
-      } else {
-        console.warn('[Jukebox] VRM AnimationModule 未初始化');
-      }
+      // 使用 VRMManager 播放 VRMA（manager 内部会确保 animation 模块已初始化）
+      await window.vrmManager.playVRMAAnimation(vrmaPath, {
+        loop: false,
+        fadeInDuration: 0.5,
+        fadeOutDuration: 0.5
+      });
+      Jukebox.State.isVMDPlaying = true;
+      console.log('[Jukebox] VRMA 动画已播放:', vrmaPath);
     } catch (error) {
       console.error('[Jukebox] VRMA 播放失败:', error);
     }
@@ -4988,6 +4986,27 @@ window.Jukebox = {
   restoreIdleAnimation: async function() {
     // 独立窗口模式：Pet 侧在 stopVMD 时自动恢复，此处无需操作
     if (window.__NEKO_JUKEBOX_STANDALONE__) return;
+
+    // VRM 模式：恢复 VRM 待机动画
+    var modelType = Jukebox.getModelType();
+    if (modelType === 'vrm' && window.vrmManager) {
+      try {
+        var vrmIdleList = window.lanlan_config?.vrmIdleAnimations;
+        var vrmIdleUrl = (Array.isArray(vrmIdleList) && vrmIdleList.length > 0) ? vrmIdleList[0] : null;
+        if (!vrmIdleUrl) {
+          vrmIdleUrl = window.lanlan_config?.vrmIdleAnimation || '/static/vrm/animation/wait03.vrma';
+        }
+        await window.vrmManager.playVRMAAnimation(vrmIdleUrl, {
+          loop: true,
+          isIdle: true
+        });
+        console.log('[Jukebox] VRM 待机动画已恢复');
+      } catch (error) {
+        console.warn('[Jukebox] VRM 待机动画恢复失败:', error);
+      }
+      return;
+    }
+
     if (!window.mmdManager) return;
 
     const restoreRequestId = Jukebox.State.playRequestId;
@@ -5450,14 +5469,18 @@ window.Jukebox = {
     }
 
     // 如果用户设置了默认动画，优先使用它
-    // 但如果默认动画已被删除（不在boundActions中），则不播放动画
     if (song.defaultAction) {
       const defaultAction = formatActions.find(a => a.id === song.defaultAction);
       if (defaultAction) {
         return defaultAction;
       }
-      // 默认动画已删除，不播放动画
-      console.log('[Jukebox] 默认动画已被删除，不播放动画');
+      // defaultAction 是其他格式（如 VMD），当前格式（如 VRMA）有可用动画则 fallback
+      if (formatActions.length > 0) {
+        console.log('[Jukebox] 默认动画格式不匹配，使用该格式的第一个动画:', formatActions[0].name);
+        return formatActions[0];
+      }
+      // 该格式无可用动画
+      console.log('[Jukebox] 默认动画格式不匹配且无可用动画');
       return null;
     }
 
