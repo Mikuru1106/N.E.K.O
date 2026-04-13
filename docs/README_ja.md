@@ -453,7 +453,7 @@ uv run python agent_server.py
 
 ```
 N.E.K.O/
-├── 📁 .agent/                   # 🤖 AIコーディングアシスタントのルールとスキル（Claude Code / Cursor 等が自動読み込み）
+├── 📁 .agent/                   # 🤖 AIコーディングアシスタントのルールとスキル（Claude Code が自動読み込み、他のツールは手動インポート可）
 ├── 📁 brain/                    # 🧠 エージェントモジュール
 │   ├── computer_use.py          # PC操作
 │   ├── browser_use_adapter.py   # ブラウザ自動化

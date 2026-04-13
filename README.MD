@@ -518,7 +518,7 @@ uv run python agent_server.py
 
 ```
 N.E.K.O/
-├── 📁 .agent/                   # 🤖 AI 编程助手规范与技能集（Claude Code / Cursor 等自动加载）
+├── 📁 .agent/                   # 🤖 AI 编程助手规范与技能集（Claude Code 自动加载，其他工具可手动导入）
 ├── 📁 brain/                    # 🧠 Agent 智能体模块
 │   ├── computer_use.py          # 电脑操控
 │   ├── browser_use_adapter.py   # 浏览器自动化

@@ -461,7 +461,7 @@ Visit `http://localhost:48911/api_key` to configure directly through the Web int
 
 ```
 N.E.K.O/
-├── 📁 .agent/                   # 🤖 AI coding assistant rules & skills (auto-loaded by Claude Code / Cursor etc.)
+├── 📁 .agent/                   # 🤖 AI coding assistant rules & skills (auto-loaded by Claude Code; other tools can import manually)
 ├── 📁 brain/                    # 🧠 Agent modules
 │   ├── computer_use.py          # Computer control
 │   ├── browser_use_adapter.py   # Browser automation
