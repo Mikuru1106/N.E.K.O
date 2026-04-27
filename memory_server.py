@@ -1439,7 +1439,7 @@ async def _periodic_signal_extraction_loop():
                 messages = convert_to_messages(json.dumps(message_dicts))
 
                 try:
-                    persisted, signals = await fact_store.aextract_facts_and_detect_signals(
+                    persisted, signals, batch_fact_ids = await fact_store.aextract_facts_and_detect_signals(
                         name, messages,
                         reflection_engine=reflection_engine,
                         persona_manager=persona_manager,
@@ -1465,6 +1465,13 @@ async def _periodic_signal_extraction_loop():
                     logger.info(
                         f"[SignalLoop] {name}: dispatch {len(signals)} 个 evidence 信号"
                     )
+
+                # Drain checkpoint：dispatch 全部成功（含 signals=[] 即 LLM
+                # 看过没关联）才 mark batch processed。任何 aapply 失败保留
+                # signal_processed=False 让下轮 idle 重试这批 fact，避免
+                # 把没落地的 signal 永久跳过（CodeRabbit fingerprint c755101c）。
+                if dispatch_ok and batch_fact_ids:
+                    await fact_store.amark_signal_processed(name, batch_fact_ids)
 
                 if not dispatch_ok:
                     logger.warning(
@@ -1519,8 +1526,18 @@ async def _amaybe_trigger_negative_keyword_hook(
     if not observations:
         return
 
-    user_msg_text = "\n".join(user_messages[-3:])
-    obs_text = "\n".join(f"[{o['id']}] {o.get('text', '')}" for o in observations)
+    from config import (
+        NEGATIVE_KEYWORD_CHECK_CONTEXT_ITEMS,
+        EVIDENCE_PER_OBSERVATION_MAX_TOKENS,
+        EVIDENCE_OBSERVATIONS_TOTAL_MAX_TOKENS,
+    )
+    from utils.tokenize import truncate_to_tokens
+    user_msg_text = "\n".join(user_messages[-NEGATIVE_KEYWORD_CHECK_CONTEXT_ITEMS:])
+    obs_text = "\n".join(
+        f"[{o['id']}] {truncate_to_tokens(o.get('text', '') or '', EVIDENCE_PER_OBSERVATION_MAX_TOKENS)}"
+        for o in observations
+    )
+    obs_text = truncate_to_tokens(obs_text, EVIDENCE_OBSERVATIONS_TOTAL_MAX_TOKENS)
     prompt = get_negative_target_check_prompt(lang) \
         .replace('{USER_MESSAGES}', user_msg_text) \
         .replace('{OBSERVATIONS}', obs_text)

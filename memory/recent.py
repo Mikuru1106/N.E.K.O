@@ -15,17 +15,19 @@ from config.prompts_memory import (
 from utils.cloudsave_runtime import MaintenanceModeError, assert_cloudsave_writable
 from utils.language_utils import get_global_language
 from utils.tokenize import acount_tokens
+from config import (
+    RECENT_HISTORY_MAX_ITEMS,
+    RECENT_COMPRESS_THRESHOLD_ITEMS,
+    RECENT_SUMMARY_MAX_TOKENS,
+    RECENT_PER_MESSAGE_MAX_TOKENS,
+)
 
-# Stage-1 → Stage-2 trigger threshold. Two-stage flow:
-#   Stage 1 (`compress_history`) summarises raw messages with no explicit
-#     length cap in the prompt — model writes naturally.
-#   Stage 2 (`further_compress`) is invoked only when Stage-1 output exceeds
-#     this threshold; its own prompt hard-caps output at 500 chars/words per
-#     language, so Stage-2 results are always far under MAX_SUMMARY_TOKENS.
-# 1000 tokens ≈ 1400 CJK chars / ~4000 English chars — generous enough that
-# Stage 2 only triggers on genuinely runaway Stage-1 outputs (the Stage-2
-# 500-char/word cap is independent of this gate).
-MAX_SUMMARY_TOKENS = 1000
+# Backward-compat alias (Stage-1 → Stage-2 trigger threshold).
+# Two-stage flow: Stage 1 (`compress_history`) summarises raw messages with no
+# explicit length cap; Stage 2 (`further_compress`) is invoked only when Stage-1
+# output exceeds this threshold. Stage-2's own prompt hard-caps output at
+# 500 chars/words per language.
+MAX_SUMMARY_TOKENS = RECENT_SUMMARY_MAX_TOKENS
 
 # Setup logger
 from utils.file_utils import (
@@ -38,7 +40,11 @@ from utils.logger_config import setup_logging
 logger, log_config = setup_logging(service_name="Memory", log_level=logging.INFO)
 
 class CompressedRecentHistoryManager:
-    def __init__(self, max_history_length=10, compress_threshold=15):
+    def __init__(
+        self,
+        max_history_length: int = RECENT_HISTORY_MAX_ITEMS,
+        compress_threshold: int = RECENT_COMPRESS_THRESHOLD_ITEMS,
+    ):
         self._config_manager = get_config_manager()
         # 通过get_character_data获取相关变量
         _, _, _, _, name_mapping, _, _, _, recent_log = self._config_manager.get_character_data()
@@ -212,6 +218,12 @@ class CompressedRecentHistoryManager:
 
     # detailed: 保留尽可能多的细节
     async def compress_history(self, messages, lanlan_name, detailed=False):
+        from utils.tokenize import truncate_head_tail_tokens
+        # 单条 message 文本超过 RECENT_PER_MESSAGE_MAX_TOKENS 时做头尾保留
+        # 截断（head=tail=半数 token）。用户长贴 / AI 偶尔写小作文都会触发；
+        # 头尾各保留确保问候/问题与结尾的总结/请求都不丢，中段砍掉。
+        per_msg_cap = RECENT_PER_MESSAGE_MAX_TOKENS
+        head_tail = per_msg_cap // 2
         name_mapping = self.name_mapping.copy()
         name_mapping['ai'] = lanlan_name
         lines = []
@@ -219,6 +231,7 @@ class CompressedRecentHistoryManager:
             role = name_mapping.get(getattr(msg, 'type', ''), getattr(msg, 'type', ''))
             content = getattr(msg, 'content', '')
             if isinstance(content, str):
+                content = truncate_head_tail_tokens(content, head_tail, head_tail)
                 line = f"{role} | {content}"
             else:
                 parts = []
@@ -231,6 +244,7 @@ class CompressedRecentHistoryManager:
                 except Exception:
                     parts = [str(content)]
                 joined = "\n".join(parts)
+                joined = truncate_head_tail_tokens(joined, head_tail, head_tail)
                 line = f"{role} | {joined}"
             lines.append(line)
         messages_text = "\n".join(lines)
@@ -299,6 +313,12 @@ class CompressedRecentHistoryManager:
         return SystemMessage(content=_loc(MEMORY_MEMO_EMPTY, get_global_language())), ""
 
     async def further_compress(self, initial_summary):
+        # Stage-2 LLM 输出硬限：RECENT_SUMMARY_MAX_TOKENS + 100 余量 = 1100 token。
+        # prompt 要求 700 字/words：CJK 700 字 ≈ 1050 token (×1.5)、
+        # EN 700 words ≈ 933 token，都安全落在 1100 cap 之下。
+        # 仍然防 LLM 写小作文；如果真撞到 cap，下面句末标点回溯保证语义边界。
+        from utils.tokenize import truncate_to_last_sentence_end
+        stage2_cap = RECENT_SUMMARY_MAX_TOKENS + 100
         retries = 0
         max_retries = 3
         while retries < max_retries:
@@ -307,7 +327,10 @@ class CompressedRecentHistoryManager:
                 set_call_type("memory_compression")
                 llm = self._get_llm()
                 try:
-                    response_content = (await llm.ainvoke(get_further_summarize_prompt(get_global_language()) % initial_summary)).content
+                    response_content = (await llm.ainvoke(
+                        get_further_summarize_prompt(get_global_language()) % initial_summary,
+                        max_completion_tokens=stage2_cap,
+                    )).content
                 finally:
                     await llm.aclose()
                 response_content = str(response_content).strip()
@@ -317,8 +340,17 @@ class CompressedRecentHistoryManager:
                 summary_json = robust_json_loads(response_content)
                 # 从JSON字典中提取对话摘要，假设摘要存储在名为'key'的键下
                 if '对话摘要' in summary_json:
-                    print(f"💗第二轮摘要结果：{summary_json['对话摘要']}")
-                    return summary_json['对话摘要']
+                    summary_text = str(summary_json['对话摘要']).strip()
+                    # 命中 stage2_cap → LLM 输出可能停在句子中段（如逗号 / 短语）。
+                    # 回溯到最后一个句末标点（. ! ? 。！？… \n），保证持久化的
+                    # 摘要语义边界完整。如果根本没找到句末标点（极端短文本），
+                    # truncate_to_last_sentence_end 返回 ""，此时退到原文以避免
+                    # 完全丢摘要。
+                    sane = truncate_to_last_sentence_end(summary_text)
+                    if not sane:
+                        sane = summary_text
+                    print(f"💗第二轮摘要结果：{sane}")
+                    return sane
                 else:
                     print('💥 第二轮摘要failed: ', response_content)
                     retries += 1

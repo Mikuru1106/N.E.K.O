@@ -1574,15 +1574,25 @@ class PersonaManager:
         if not corrections:
             return 0
 
-        # 合并所有矛盾为单个 prompt
+        # 合并所有矛盾为单个 prompt。受 PERSONA_CORRECTION_BATCH_LIMIT
+        # 限制：corrections 队列可能堆积，单次只处理前 N 条，剩下的下次
+        # 触发时再处理。
+        from config import PERSONA_CORRECTION_BATCH_LIMIT
         pairs = []
         for i, item in enumerate(corrections):
             old_text = item.get('old_text', '')
             new_text = item.get('new_text', '')
             if old_text and new_text:
                 pairs.append((i, item))
+            if len(pairs) >= PERSONA_CORRECTION_BATCH_LIMIT:
+                break
         if not pairs:
             return 0
+        # 仅允许"本批送进 prompt"的全局 index 被消费 —— LLM 偶尔会回写
+        # 没在这一批 prompt 里的合法全局 index（比如 hallucinate 出未来批
+        # 的 idx），不防的话会误改未送审的 corrections，导致队列数据被
+        # 错误消费。
+        allowed_indices = {i for i, _ in pairs}
 
         batch_text = "\n".join(
             f"[{i}] 已有: {item['old_text']} | 新观察: {item['new_text']}"
@@ -1621,7 +1631,7 @@ class PersonaManager:
                 continue
             try:
                 idx = int(result.get('index', -1))
-                if idx < 0 or idx >= len(corrections):
+                if idx < 0 or idx >= len(corrections) or idx not in allowed_indices:
                     continue
                 item = corrections[idx]
             except (ValueError, TypeError):
@@ -1703,7 +1713,7 @@ class PersonaManager:
                     continue
                 try:
                     idx = int(raw_idx)
-                    if 0 <= idx < len(corrections):
+                    if 0 <= idx < len(corrections) and idx in allowed_indices:
                         key = corrections[idx].get('created_at', '')
                         if key:
                             processed_keys.add(key)
