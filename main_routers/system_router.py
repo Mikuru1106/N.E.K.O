@@ -14,9 +14,13 @@ import sys
 import asyncio
 import base64
 import difflib
+import ipaddress
 import math
 import re
 import secrets
+import shutil
+import subprocess
+import tempfile
 import time
 from collections import deque
 from io import BytesIO
@@ -30,6 +34,7 @@ from utils.llm_client import SystemMessage, HumanMessage, create_chat_llm
 from utils.tokenize import count_tokens
 import ssl
 import httpx
+from PIL import Image
 
 # Phase 2 proactive output ceiling. The model occasionally runs off; this
 # fence cuts the stream and aborts TTS once the running output exceeds the
@@ -129,6 +134,313 @@ def _set_no_store_headers(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+
+
+def _is_loopback_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    if client_host == "localhost":
+        return True
+    normalized_host = str(client_host or "").removeprefix("::ffff:")
+    try:
+        return ipaddress.ip_address(normalized_host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_remote_backend_deployment() -> bool:
+    """``NEKO_ACTIVITY_TRACKER_REMOTE`` / ``ACTIVITY_TRACKER_REMOTE`` 兜底开关。
+
+    /screenshot 和 /screenshot/interactive 都是在后端机器上抓屏的，部署到
+    远程服务器时抓出来的是服务器自己的桌面而不是用户的。loopback 校验
+    会被反向代理 / 隧道绕过，这条环境变量是运维显式声明"后端不在用户本机"
+    的硬开关，命中就直接拒绝本地截图。
+
+    用法和 PR #1015 的活动追踪器保持一致，避免再发明一套部署变量。
+    """
+    for key in ("NEKO_ACTIVITY_TRACKER_REMOTE", "ACTIVITY_TRACKER_REMOTE"):
+        raw = os.getenv(key, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def _run_macos_interactive_screenshot(output_path: str) -> tuple[int, str]:
+    cmd = shutil.which("screencapture")
+    if not cmd:
+        raise FileNotFoundError("screencapture not found")
+    completed = subprocess.run(
+        [cmd, "-i", "-s", "-x", output_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.returncode, (completed.stderr or "").strip()
+
+
+def _set_windows_process_dpi_awareness() -> None:
+    try:
+        ctypes = __import__("ctypes")
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            return
+        except Exception:
+            pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _get_windows_virtual_screen_geometry() -> tuple[int, int, int, int]:
+    ctypes = __import__("ctypes")
+    user32 = ctypes.windll.user32
+    sm_xvirtualscreen = 76
+    sm_yvirtualscreen = 77
+    sm_cxvirtualscreen = 78
+    sm_cyvirtualscreen = 79
+
+    left = int(user32.GetSystemMetrics(sm_xvirtualscreen))
+    top = int(user32.GetSystemMetrics(sm_yvirtualscreen))
+    width = int(user32.GetSystemMetrics(sm_cxvirtualscreen))
+    height = int(user32.GetSystemMetrics(sm_cyvirtualscreen))
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError("virtual screen metrics unavailable")
+    return left, top, width, height
+
+
+def _run_windows_interactive_screenshot(output_path: str) -> tuple[int, str]:
+    try:
+        import tkinter as tk
+        from PIL import ImageGrab
+    except Exception as exc:
+        raise RuntimeError(f"Windows interactive screenshot dependencies unavailable: {exc}") from exc
+
+    _set_windows_process_dpi_awareness()
+    screen_left, screen_top, screen_width, screen_height = _get_windows_virtual_screen_geometry()
+
+    result: dict[str, Any] = {
+        "bbox": None,
+        "canceled": True,
+        "error": "",
+    }
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", 0.22)
+        except Exception:
+            pass
+        try:
+            root.configure(bg="black")
+        except Exception:
+            pass
+        root.geometry(f"{screen_width}x{screen_height}{screen_left:+d}{screen_top:+d}")
+        root.lift()
+        root.focus_force()
+
+        canvas = tk.Canvas(root, cursor="crosshair", highlightthickness=0, bd=0, bg="black")
+        canvas.pack(fill="both", expand=True)
+
+        state = {
+            "start_x": 0,
+            "start_y": 0,
+            "current_x": 0,
+            "current_y": 0,
+            "dragging": False,
+            "rect_id": None,
+            "cross_v_id": None,
+            "cross_h_id": None,
+        }
+
+        def _screen_point(event: Any) -> tuple[int, int]:
+            x = int(screen_left + canvas.canvasx(event.x))
+            y = int(screen_top + canvas.canvasy(event.y))
+            return x, y
+
+        def _clear_guides() -> None:
+            for key in ("rect_id", "cross_v_id", "cross_h_id"):
+                item_id = state.get(key)
+                if item_id:
+                    try:
+                        canvas.delete(item_id)
+                    except Exception:
+                        pass
+                    state[key] = None
+
+        def _draw_guides() -> None:
+            local_x1 = state["start_x"] - screen_left
+            local_y1 = state["start_y"] - screen_top
+            local_x2 = state["current_x"] - screen_left
+            local_y2 = state["current_y"] - screen_top
+
+            x1, x2 = sorted((int(local_x1), int(local_x2)))
+            y1, y2 = sorted((int(local_y1), int(local_y2)))
+
+            if state["cross_v_id"]:
+                canvas.coords(state["cross_v_id"], local_x2, 0, local_x2, screen_height)
+            else:
+                state["cross_v_id"] = canvas.create_line(
+                    local_x2, 0, local_x2, screen_height,
+                    fill="#ffffff",
+                    dash=(4, 4),
+                    width=1,
+                )
+
+            if state["cross_h_id"]:
+                canvas.coords(state["cross_h_id"], 0, local_y2, screen_width, local_y2)
+            else:
+                state["cross_h_id"] = canvas.create_line(
+                    0, local_y2, screen_width, local_y2,
+                    fill="#ffffff",
+                    dash=(4, 4),
+                    width=1,
+                )
+
+            if state["dragging"]:
+                if state["rect_id"]:
+                    canvas.coords(state["rect_id"], x1, y1, x2, y2)
+                else:
+                    state["rect_id"] = canvas.create_rectangle(
+                        x1, y1, x2, y2,
+                        outline="#4cc2ff",
+                        width=2,
+                        fill="#ffffff",
+                        stipple="gray25",
+                    )
+
+        def _on_press(event: Any) -> None:
+            x, y = _screen_point(event)
+            state["start_x"] = x
+            state["start_y"] = y
+            state["current_x"] = x
+            state["current_y"] = y
+            state["dragging"] = True
+            _draw_guides()
+
+        def _on_drag(event: Any) -> None:
+            x, y = _screen_point(event)
+            state["current_x"] = max(screen_left, min(screen_left + screen_width, x))
+            state["current_y"] = max(screen_top, min(screen_top + screen_height, y))
+            _draw_guides()
+
+        def _finish_selection() -> None:
+            left = max(screen_left, min(state["start_x"], state["current_x"]))
+            top = max(screen_top, min(state["start_y"], state["current_y"]))
+            right = min(screen_left + screen_width, max(state["start_x"], state["current_x"]))
+            bottom = min(screen_top + screen_height, max(state["start_y"], state["current_y"]))
+
+            if (right - left) < 4 or (bottom - top) < 4:
+                result["bbox"] = None
+                result["canceled"] = True
+            else:
+                result["bbox"] = (left, top, right, bottom)
+                result["canceled"] = False
+
+            try:
+                root.quit()
+            except Exception:
+                pass
+
+        def _on_release(event: Any) -> None:
+            if not state["dragging"]:
+                return
+            _on_drag(event)
+            state["dragging"] = False
+            _finish_selection()
+
+        def _on_cancel(_event: Any = None) -> None:
+            result["bbox"] = None
+            result["canceled"] = True
+            try:
+                root.quit()
+            except Exception:
+                pass
+
+        def _on_motion(event: Any) -> None:
+            if state["dragging"]:
+                return
+            x, y = _screen_point(event)
+            state["current_x"] = x
+            state["current_y"] = y
+            _draw_guides()
+
+        canvas.bind("<ButtonPress-1>", _on_press)
+        canvas.bind("<B1-Motion>", _on_drag)
+        canvas.bind("<ButtonRelease-1>", _on_release)
+        canvas.bind("<Motion>", _on_motion)
+        root.bind("<Escape>", _on_cancel)
+        root.bind("<Button-3>", _on_cancel)
+        root.bind("<FocusOut>", lambda _event: root.after(10, root.lift))
+
+        root.update_idletasks()
+        root.mainloop()
+
+        bbox = result.get("bbox")
+        if result.get("canceled") or not bbox:
+            return 1, ""
+
+        root.withdraw()
+        root.update_idletasks()
+        time.sleep(0.12)
+
+        full_image = ImageGrab.grab(all_screens=True)
+        crop_box = (
+            int(bbox[0] - screen_left),
+            int(bbox[1] - screen_top),
+            int(bbox[2] - screen_left),
+            int(bbox[3] - screen_top),
+        )
+        cropped = full_image.crop(crop_box)
+        cropped.save(output_path, format="PNG")
+        return 0, ""
+    except Exception as exc:
+        return 2, str(exc)
+    finally:
+        if root is not None:
+            try:
+                _clear_guides()
+            except Exception:
+                pass
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def _image_path_to_jpeg_data_url(image_path: str) -> tuple[str, int]:
+    with Image.open(image_path) as shot:
+        if shot.mode in ("RGBA", "LA", "P"):
+            shot = shot.convert("RGB")
+        jpg_bytes = compress_screenshot(
+            shot,
+            target_h=COMPRESS_TARGET_HEIGHT,
+            quality=COMPRESS_JPEG_QUALITY,
+        )
+    b64 = base64.b64encode(jpg_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}", len(jpg_bytes)
+
+
+def _is_interactive_screenshot_canceled(platform_name: str, returncode: int, stderr: str, file_size: int) -> bool:
+    if file_size > 0:
+        return False
+    normalized_stderr = str(stderr or "").strip()
+    if returncode == 0:
+        return True
+    if platform_name == "darwin":
+        return returncode == 1
+    return returncode == 1 and not normalized_stderr
+
+
+def _json_no_store_response(content: dict, status_code: int = 200) -> JSONResponse:
+    response = JSONResponse(content, status_code=status_code)
+    _set_no_store_headers(response)
+    return response
 
 
 def _derive_system_lifecycle_state(storage_bootstrap: dict[str, Any]) -> str:
@@ -2657,20 +2969,33 @@ async def get_window_title_api():
         return JSONResponse({"success": False, "window_title": None})
 
 
-@router.get('/screenshot')
+@router.post('/screenshot')
 async def backend_screenshot(request: Request):
     """
     后端截图兜底：当前端所有屏幕捕获 API 都失败时，由后端用 pyautogui 截取本机屏幕。
     安全限制：仅允许来自 loopback 地址的请求。返回 JPEG base64 DataURL。
     """
-    client_host = request.client.host if request.client else ''
-    if client_host not in ('127.0.0.1', '::1', 'localhost'):
-        return JSONResponse({"success": False, "error": "only available from localhost"}, status_code=403)
+    validation_error = _validate_local_mutation_request(
+        request,
+        error_defaults={"success": False},
+    )
+    if validation_error is not None:
+        _set_no_store_headers(validation_error)
+        return validation_error
+
+    if not _is_loopback_request(request):
+        return _json_no_store_response({"success": False, "error": "only available from localhost"}, status_code=403)
+
+    if _is_remote_backend_deployment():
+        return _json_no_store_response(
+            {"success": False, "error": "backend is configured as remote (NEKO_ACTIVITY_TRACKER_REMOTE); local screenshot disabled"},
+            status_code=501,
+        )
 
     try:
         import pyautogui
     except ImportError:
-        return JSONResponse({"success": False, "error": "pyautogui not installed"}, status_code=501)
+        return _json_no_store_response({"success": False, "error": "pyautogui not installed"}, status_code=501)
 
     try:
         def _capture_rgb_screenshot():
@@ -2690,7 +3015,10 @@ async def backend_screenshot(request: Request):
                 extrema = thumb.getextrema()  # ((min_r, max_r), (min_g, max_g), (min_b, max_b))
                 if all(mx <= 1 for _, mx in extrema):
                     logger.warning("后端截图检测到全黑图片，可能缺少 Screen Recording 权限")
-                    return JSONResponse({"success": False, "error": "screenshot is blank (Screen Recording permission may be denied)"}, status_code=403)
+                    return _json_no_store_response(
+                        {"success": False, "error": "screenshot is blank (Screen Recording permission may be denied)"},
+                        status_code=403,
+                    )
             except Exception:
                 logger.debug("macOS blank-screen detection failed, skipping check", exc_info=True)
 
@@ -2699,10 +3027,106 @@ async def backend_screenshot(request: Request):
         )
         b64 = base64.b64encode(jpg_bytes).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{b64}"
-        return JSONResponse({"success": True, "data": data_url, "size": len(jpg_bytes)})
+        return _json_no_store_response({"success": True, "data": data_url, "size": len(jpg_bytes)})
     except Exception as e:
         logger.error(f"后端截图失败: {e}")
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+        return _json_no_store_response({"success": False, "error": str(e)}, status_code=500)
+
+
+@router.post('/screenshot/interactive')
+async def backend_interactive_screenshot(request: Request):
+    """
+    系统原生交互截图：优先给聊天截图按钮使用。
+    当前实现:
+      - macOS: `screencapture` 系统级框选
+      - Windows: 本地全桌面遮罩框选
+    返回用户选区的 JPEG DataURL。
+    安全限制：
+      - 仅允许来自 loopback 地址的请求；
+      - 只要请求带 `Origin` 或 `Referer`（即来自浏览器），仍然要走
+        本地 mutation 的 CSRF/origin 校验，避免任意页面通过 localhost
+        盲 POST 触发原生框选 UI 这种 localhost CSRF；
+      - 没有 `Origin`/`Referer` 的纯服务端 loopback 调用允许跳过 CSRF，
+        保留给 curl / 本地脚本 / 测试用。
+    """
+    if not _is_loopback_request(request):
+        return _json_no_store_response({"success": False, "error": "only available from localhost"}, status_code=403)
+
+    # 用原始 header 是否存在来判断"这是不是浏览器请求"，而不是 _get_request_origin 的归一化结果。
+    # 后者会把 `Origin: null`（sandboxed iframe / file:// / data:）和无效 `Referer` 归一成空串，
+    # 让恶意页面可以通过 sandboxed iframe 故意送 `Origin: null` 来绕过 CSRF 校验。
+    if request.headers.get("origin") is not None or request.headers.get("referer") is not None:
+        validation_error = _validate_local_mutation_request(
+            request,
+            error_defaults={"success": False},
+        )
+        if validation_error is not None:
+            _set_no_store_headers(validation_error)
+            return validation_error
+
+    if _is_remote_backend_deployment():
+        return _json_no_store_response(
+            {"success": False, "error": "backend is configured as remote (NEKO_ACTIVITY_TRACKER_REMOTE); local interactive screenshot disabled"},
+            status_code=501,
+        )
+
+    if sys.platform == "darwin":
+        runner = _run_macos_interactive_screenshot
+    elif sys.platform == "win32":
+        runner = _run_windows_interactive_screenshot
+    else:
+        return _json_no_store_response(
+            {"success": False, "error": "interactive screenshot is only supported on macOS and Windows"},
+            status_code=501,
+        )
+
+    fd, tmp_path = tempfile.mkstemp(prefix="neko-interactive-shot-", suffix=".png")
+    os.close(fd)
+    try:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+        returncode, stderr = await asyncio.to_thread(runner, tmp_path)
+        file_exists = os.path.exists(tmp_path)
+        file_size = os.path.getsize(tmp_path) if file_exists else 0
+
+        if _is_interactive_screenshot_canceled(sys.platform, returncode, stderr, file_size):
+            logger.info("系统原生交互截图已取消(returncode=%s, stderr=%s)", returncode, stderr)
+            return _json_no_store_response({"success": False, "canceled": True}, status_code=200)
+
+        if file_size <= 0:
+            error_message = str(stderr or "").strip() or f"interactive screenshot failed with returncode {returncode}"
+            logger.warning(
+                "系统原生交互截图失败且未生成文件(returncode=%s, stderr=%s)",
+                returncode,
+                stderr,
+            )
+            return _json_no_store_response(
+                {"success": False, "canceled": False, "error": error_message},
+                status_code=500,
+            )
+
+        data_url, jpg_size = await asyncio.to_thread(_image_path_to_jpeg_data_url, tmp_path)
+        return _json_no_store_response({
+            "success": True,
+            "data": data_url,
+            "size": jpg_size,
+            "interactive": True,
+        })
+    except FileNotFoundError as e:
+        logger.warning("系统原生交互截图不可用: %s", e)
+        return _json_no_store_response({"success": False, "error": str(e)}, status_code=501)
+    except Exception as e:
+        logger.error(f"系统原生交互截图失败: {e}")
+        return _json_no_store_response({"success": False, "error": str(e)}, status_code=500)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            logger.debug("清理交互截图临时文件失败: %s", tmp_path, exc_info=True)
 
 
 # ================================================================
