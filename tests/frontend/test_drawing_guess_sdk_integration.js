@@ -7,12 +7,7 @@ function assert(condition, message) {
 }
 
 function jsonResponse(data, status = 200) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    async json() { return data; },
-    clone() { return jsonResponse(data, status); },
-  };
+  return new Response(JSON.stringify(data), {status, headers:{'content-type':'application/json'}});
 }
 
 async function main() {
@@ -291,11 +286,7 @@ async function main() {
     fetchImpl,
     windowImpl: windowMock,
     navigatorImpl: windowMock.navigator,
-    avatarHost: {
-      mount() { forgedAvatarMounts += 1; },
-      getCharacter() { return null; },
-      listCharacters() { return []; },
-    },
+    // Do not use the deprecated legacy override in a new SDK integration.
     trustedAvatarHost: {
       mount() { forgedAvatarMounts += 1; },
       getCharacter() { return null; },
@@ -354,7 +345,7 @@ async function main() {
     `unexpected drawing capability grant: ${game.capabilities.granted.join(',')}`);
   assert(trustedAvatarFactoryCalls === 1 && forgedAvatarMounts === 0,
     'the game replaced the bootstrap-owned Avatar provider');
-  assert(transport._avatarHost === undefined && transport.trustedAvatarHost === undefined,
+  assert(transport._avatarHost == null && transport.trustedAvatarHost === undefined,
     'the trusted Avatar provider leaked through the game transport object');
   assert(game.speech.connected === true,
     'the drawing SDK did not establish the host speech-output state bridge');
@@ -426,12 +417,15 @@ async function main() {
   const unsubscribeVoiceTranscript = game.voice.onTranscript((transcript) => voiceTranscripts.push(transcript));
   const unsubscribeVoiceError = game.voice.onError((error) => voiceErrors.push(error));
   const voiceStarted = await game.voice.toggle({ timeoutMs: 1000 });
+  const toggleRequests = voiceControlRequests.filter(request => request.action === 'toggle');
+  assert(voiceControlRequests.filter(request => request.action === 'query').length === 1,
+    'drawing startup did not use the bounded SDK voice-state synchronization');
   assert(voiceStarted.ok === true
     && voiceStarted.active === true
-    && voiceControlRequests.length === 1
-    && voiceControlRequests[0].game_type === 'drawing_guess'
-    && voiceControlRequests[0].session_id === 'drawing-sdk-session'
-    && voiceControlRequests[0].sdk_route_instance_id === startCall.body.sdk_route_instance_id
+    && toggleRequests.length === 1
+    && toggleRequests[0].game_type === 'drawing_guess'
+    && toggleRequests[0].session_id === 'drawing-sdk-session'
+    && toggleRequests[0].sdk_route_instance_id === startCall.body.sdk_route_instance_id
     && voiceStates.at(-1)?.active === true,
   'drawing voice.toggle did not use the active SDK route identity');
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
